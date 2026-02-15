@@ -1,5 +1,7 @@
+mod input;
 mod terminal;
 
+use input::{Event, Key, KeyEvent, read_event};
 use terminal::{Terminal, detect_color_mode};
 
 fn main() {
@@ -18,20 +20,64 @@ fn main() {
     terminal::clear_screen();
     terminal::move_cursor(1, 1);
 
-    let msg = format!(
-        "Zelux — Terminal size: {}x{} | Color mode: {:?}\r\nPress any key to exit...",
+    let header = format!(
+        "Zelux — {}x{} | {:?} | Press Ctrl+Q to exit\r\n\r\n",
         w, h, color_mode,
     );
-    terminal::write_all(msg.as_bytes());
+    terminal::write_all(header.as_bytes());
     terminal::flush();
 
-    // Block until a keypress arrives
     loop {
-        if term.read_byte().is_some() {
-            break;
+        // Check for terminal resize
+        if term.check_resize() {
+            let (w, h) = term.size();
+            let msg = format!("[Resize: {}x{}]\r\n", w, h);
+            terminal::write_all(msg.as_bytes());
+            terminal::flush();
+        }
+
+        let event = read_event(&term);
+
+        match &event {
+            Event::None => continue,
+
+            Event::Key(KeyEvent {
+                key: Key::Char('q'),
+                ctrl: true,
+                ..
+            }) => break,
+
+            Event::Key(ke) => {
+                let msg = format!("Key: {:?}\r\n", ke);
+                terminal::write_all(msg.as_bytes());
+                terminal::flush();
+            }
+
+            Event::Mouse(me) => {
+                let msg = format!("Mouse: {:?}\r\n", me);
+                terminal::write_all(msg.as_bytes());
+                terminal::flush();
+            }
+
+            Event::Paste(text) => {
+                let preview = if text.len() > 60 {
+                    format!("{}...", &text[..60])
+                } else {
+                    text.clone()
+                };
+                let msg = format!("Paste ({} bytes): {:?}\r\n", text.len(), preview);
+                terminal::write_all(msg.as_bytes());
+                terminal::flush();
+            }
+
+            Event::Resize => {
+                let (w, h) = term.size();
+                let msg = format!("[Resize event: {}x{}]\r\n", w, h);
+                terminal::write_all(msg.as_bytes());
+                terminal::flush();
+            }
         }
     }
 
-    // Terminal::drop restores everything
     drop(term);
 }
