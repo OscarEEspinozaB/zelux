@@ -1,3 +1,4 @@
+mod buffer;
 mod input;
 mod terminal;
 
