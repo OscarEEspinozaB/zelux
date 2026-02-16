@@ -24,7 +24,19 @@ enum MessageType {
 
 enum PromptAction {
     OpenFile,
-    // Future: SaveAs, Find, GoToLine
+    Find,
+    Replace,
+    ReplaceWith(String),
+}
+
+// ---------------------------------------------------------------------------
+// Search state
+// ---------------------------------------------------------------------------
+
+struct SearchState {
+    pattern: String,
+    matches: Vec<(usize, usize)>, // (byte_start, byte_end)
+    current: Option<usize>,       // index into matches
 }
 
 struct Prompt {
@@ -80,6 +92,9 @@ pub struct Editor {
     // Undo/redo
     undo_stack: UndoStack,
 
+    // Search
+    search: Option<SearchState>,
+
     running: bool,
 }
 
@@ -110,6 +125,7 @@ impl Editor {
             clipboard: String::new(),
             prompt: None,
             undo_stack: UndoStack::new(),
+            search: None,
             running: true,
         })
     }
@@ -140,6 +156,7 @@ impl Editor {
             clipboard: String::new(),
             prompt: None,
             undo_stack: UndoStack::new(),
+            search: None,
             running: true,
         })
     }
@@ -264,6 +281,12 @@ impl Editor {
                             sel_range.is_some_and(|(s, e)| char_byte >= s && char_byte < e);
                         let (fg, bg, bold) = if is_selected {
                             (Color::Ansi(0), Color::Ansi(7), true)
+                        } else if let Some(is_current) = self.match_at_byte(char_byte) {
+                            if is_current {
+                                (Color::Ansi(0), Color::Ansi(6), true) // cyan bg
+                            } else {
+                                (Color::Ansi(0), Color::Ansi(3), false) // yellow bg
+                            }
                         } else {
                             (Color::Default, Color::Default, false)
                         };
@@ -587,10 +610,21 @@ impl Editor {
                 }
             }
 
-            // -- Placeholders --
+            // -- Search --
             (Key::Char('f'), true, false) => {
-                self.set_message("Find not implemented yet", MessageType::Warning);
+                self.open_find_prompt(PromptAction::Find);
             }
+            (Key::Char('h'), true, false) => {
+                self.open_find_prompt(PromptAction::Replace);
+            }
+            (Key::F(3), false, false) if !ke.shift => {
+                self.search_next();
+            }
+            (Key::F(3), false, false) if ke.shift => {
+                self.search_prev();
+            }
+
+            // -- File --
             (Key::Char('o'), true, false) => {
                 self.start_prompt("Open: ", PromptAction::OpenFile);
             }
@@ -973,6 +1007,196 @@ impl Editor {
     }
 
     // -----------------------------------------------------------------------
+    // Search
+    // -----------------------------------------------------------------------
+
+    fn open_find_prompt(&mut self, action: PromptAction) {
+        // Pre-fill with selection text (if short, single-line) or last search pattern
+        let prefill = self.prefill_search_text();
+        let label = match action {
+            PromptAction::Replace | PromptAction::ReplaceWith(_) => "Find: ",
+            _ => "Find: ",
+        };
+        self.prompt = Some(Prompt {
+            label: label.to_string(),
+            input: prefill.clone(),
+            cursor_pos: prefill.len(),
+            action,
+        });
+        self.message = None;
+        // Trigger incremental search if prefill is non-empty
+        if !prefill.is_empty() {
+            self.update_search(&prefill);
+        }
+    }
+
+    fn prefill_search_text(&self) -> String {
+        // Use selection if it's short and single-line
+        if let Some((start, end)) = self.selection_range()
+            && start != end
+        {
+            let text = self.buffer.slice(start, end);
+            if !text.contains('\n') && text.len() <= 100 {
+                return text;
+            }
+        }
+        // Fall back to last search pattern
+        if let Some(ref search) = self.search {
+            return search.pattern.clone();
+        }
+        String::new()
+    }
+
+    fn update_search(&mut self, pattern: &str) {
+        if pattern.is_empty() {
+            self.search = None;
+            return;
+        }
+        let text = self.buffer.text();
+        let matches = find_all_matches(&text, pattern);
+        let cursor_byte = self.cursor.byte_offset(&self.buffer);
+
+        // Find nearest match at or after cursor
+        let current = if matches.is_empty() {
+            None
+        } else {
+            let idx = matches
+                .iter()
+                .position(|(start, _)| *start >= cursor_byte)
+                .unwrap_or(0);
+            // Jump cursor to this match
+            self.jump_to_byte(matches[idx].0);
+            Some(idx)
+        };
+
+        self.search = Some(SearchState {
+            pattern: pattern.to_string(),
+            matches,
+            current,
+        });
+    }
+
+    fn search_next(&mut self) {
+        let (total, next_idx, byte_pos) = {
+            let search = match self.search {
+                Some(ref s) if !s.matches.is_empty() => s,
+                _ => {
+                    self.set_message("No search pattern", MessageType::Warning);
+                    return;
+                }
+            };
+            let total = search.matches.len();
+            let next = match search.current {
+                Some(i) => (i + 1) % total,
+                None => 0,
+            };
+            (total, next, search.matches[next].0)
+        };
+        self.jump_to_byte(byte_pos);
+        self.search.as_mut().unwrap().current = Some(next_idx);
+        self.set_message(
+            &format!("Match {} of {}", next_idx + 1, total),
+            MessageType::Info,
+        );
+    }
+
+    fn search_prev(&mut self) {
+        let (total, prev_idx, byte_pos) = {
+            let search = match self.search {
+                Some(ref s) if !s.matches.is_empty() => s,
+                _ => {
+                    self.set_message("No search pattern", MessageType::Warning);
+                    return;
+                }
+            };
+            let total = search.matches.len();
+            let prev = match search.current {
+                Some(i) => {
+                    if i == 0 {
+                        total - 1
+                    } else {
+                        i - 1
+                    }
+                }
+                None => total - 1,
+            };
+            (total, prev, search.matches[prev].0)
+        };
+        self.jump_to_byte(byte_pos);
+        self.search.as_mut().unwrap().current = Some(prev_idx);
+        self.set_message(
+            &format!("Match {} of {}", prev_idx + 1, total),
+            MessageType::Info,
+        );
+    }
+
+    fn jump_to_byte(&mut self, byte_pos: usize) {
+        let line = self.buffer.byte_to_line(byte_pos);
+        let line_start = self.buffer.line_start(line).unwrap_or(0);
+        let col = byte_pos - line_start;
+        self.cursor.set_position(line, col, &self.buffer);
+    }
+
+    fn execute_replace_all(&mut self, find_pattern: &str, replacement: &str) {
+        let text = self.buffer.text();
+        let matches = find_all_matches(&text, find_pattern);
+        if matches.is_empty() {
+            self.set_message("No matches to replace", MessageType::Warning);
+            return;
+        }
+        let count = matches.len();
+
+        // Replace in reverse order to preserve byte offsets
+        for &(start, end) in matches.iter().rev() {
+            let before = self.cursor_state();
+            let deleted = self.buffer.slice(start, end);
+            self.buffer.delete(start, end - start);
+            self.undo_stack.record(
+                Operation::Delete {
+                    pos: start,
+                    text: deleted,
+                },
+                before,
+                GroupContext::Other,
+            );
+            let before2 = self.cursor_state();
+            self.buffer.insert(start, replacement);
+            self.undo_stack.record(
+                Operation::Insert {
+                    pos: start,
+                    text: replacement.to_string(),
+                },
+                before2,
+                GroupContext::Other,
+            );
+        }
+
+        // Clear search state after replace
+        self.search = None;
+        self.cursor.clamp(&self.buffer);
+        self.set_message(
+            &format!("Replaced {} occurrences", count),
+            MessageType::Info,
+        );
+    }
+
+    /// Check if a byte position falls within any search match.
+    /// Returns Some(is_current_match) if in a match, None otherwise.
+    fn match_at_byte(&self, byte_pos: usize) -> Option<bool> {
+        let search = self.search.as_ref()?;
+        for (i, &(start, end)) in search.matches.iter().enumerate() {
+            if byte_pos >= start && byte_pos < end {
+                let is_current = search.current == Some(i);
+                return Some(is_current);
+            }
+            if start > byte_pos {
+                break; // matches are sorted, no need to continue
+            }
+        }
+        None
+    }
+
+    // -----------------------------------------------------------------------
     // Prompt
     // -----------------------------------------------------------------------
 
@@ -987,6 +1211,8 @@ impl Editor {
     }
 
     fn handle_prompt_key(&mut self, ke: KeyEvent) {
+        let mut input_changed = false;
+
         match (&ke.key, ke.ctrl, ke.alt) {
             (Key::Enter, false, false) => {
                 // Take the prompt out to avoid borrow issues
@@ -996,9 +1222,12 @@ impl Editor {
                     return;
                 }
                 self.execute_prompt(prompt);
+                return;
             }
             (Key::Escape, _, _) => {
+                // Keep search state so F3 still works
                 self.prompt = None;
+                return;
             }
             (Key::Backspace, false, false) => {
                 if let Some(ref mut prompt) = self.prompt
@@ -1010,6 +1239,7 @@ impl Editor {
                         let new_pos = prompt.cursor_pos - len;
                         prompt.input.drain(new_pos..prompt.cursor_pos);
                         prompt.cursor_pos = new_pos;
+                        input_changed = true;
                     }
                 }
             }
@@ -1023,6 +1253,7 @@ impl Editor {
                         prompt
                             .input
                             .drain(prompt.cursor_pos..prompt.cursor_pos + len);
+                        input_changed = true;
                     }
                 }
             }
@@ -1062,9 +1293,20 @@ impl Editor {
                     let s = ch.encode_utf8(&mut buf);
                     prompt.input.insert_str(prompt.cursor_pos, s);
                     prompt.cursor_pos += s.len();
+                    input_changed = true;
                 }
             }
             _ => {}
+        }
+
+        // Incremental search: update matches when input changes in Find/Replace prompts
+        if input_changed && let Some(ref prompt) = self.prompt {
+            let is_search_prompt =
+                matches!(prompt.action, PromptAction::Find | PromptAction::Replace);
+            if is_search_prompt {
+                let pattern = prompt.input.clone();
+                self.update_search(&pattern);
+            }
         }
     }
 
@@ -1091,6 +1333,39 @@ impl Editor {
                     }
                 }
             }
+            PromptAction::Find => {
+                // Finalize search, jump to current match
+                self.update_search(&prompt.input.clone());
+                if let Some(ref search) = self.search {
+                    if search.matches.is_empty() {
+                        self.set_message("No matches", MessageType::Warning);
+                    } else {
+                        let total = search.matches.len();
+                        let current = search.current.map_or(0, |i| i + 1);
+                        self.set_message(
+                            &format!("Match {} of {}", current, total),
+                            MessageType::Info,
+                        );
+                    }
+                }
+            }
+            PromptAction::Replace => {
+                // Save pattern, open "Replace with:" prompt
+                let pattern = prompt.input;
+                self.update_search(&pattern);
+                if let Some(ref search) = self.search
+                    && search.matches.is_empty()
+                {
+                    self.set_message("No matches", MessageType::Warning);
+                    return;
+                }
+                self.start_prompt("Replace with: ", PromptAction::ReplaceWith(pattern));
+            }
+            PromptAction::ReplaceWith(ref find_pattern) => {
+                let replacement = prompt.input;
+                let find_pattern = find_pattern.clone();
+                self.execute_replace_all(&find_pattern, &replacement);
+            }
         }
     }
 }
@@ -1098,6 +1373,28 @@ impl Editor {
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
+
+/// Case-insensitive substring search. Returns non-overlapping byte ranges.
+fn find_all_matches(text: &str, pattern: &str) -> Vec<(usize, usize)> {
+    if pattern.is_empty() {
+        return Vec::new();
+    }
+    let text_lower = text.to_lowercase();
+    let pattern_lower = pattern.to_lowercase();
+    let pat_len = pattern_lower.len();
+    let mut results = Vec::new();
+    let mut start = 0;
+    while start + pat_len <= text_lower.len() {
+        if let Some(pos) = text_lower[start..].find(&pattern_lower) {
+            let abs_pos = start + pos;
+            results.push((abs_pos, abs_pos + pat_len));
+            start = abs_pos + pat_len; // non-overlapping
+        } else {
+            break;
+        }
+    }
+    results
+}
 
 fn compute_gutter_width(line_count: usize) -> usize {
     let digits = if line_count == 0 {
@@ -1403,5 +1700,39 @@ mod tests {
         }
         assert_eq!(prompt.input, "caf");
         assert_eq!(prompt.cursor_pos, 3);
+    }
+
+    // -- Search tests --
+
+    #[test]
+    fn test_find_all_matches_basic() {
+        let matches = find_all_matches("hello hello", "hello");
+        assert_eq!(matches, vec![(0, 5), (6, 11)]);
+    }
+
+    #[test]
+    fn test_find_all_matches_case_insensitive() {
+        let matches = find_all_matches("Hello HELLO", "hello");
+        assert_eq!(matches, vec![(0, 5), (6, 11)]);
+    }
+
+    #[test]
+    fn test_find_all_matches_empty_pattern() {
+        let matches = find_all_matches("hello", "");
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_find_all_matches_no_overlap() {
+        let matches = find_all_matches("aaa", "aa");
+        assert_eq!(matches, vec![(0, 2)]);
+    }
+
+    #[test]
+    fn test_find_all_matches_utf8() {
+        let matches = find_all_matches("café café", "café");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0], (0, 5)); // "café" = 5 bytes
+        assert_eq!(matches[1], (6, 11)); // after space
     }
 }
