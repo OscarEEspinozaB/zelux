@@ -1,5 +1,7 @@
 mod buffer;
+mod cursor;
 mod input;
+mod render;
 mod terminal;
 
 use input::{Event, Key, KeyEvent, read_event};
