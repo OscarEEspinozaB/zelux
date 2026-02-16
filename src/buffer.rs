@@ -102,6 +102,22 @@ impl Buffer {
         Some(String::from_utf8_lossy(&result).into_owned())
     }
 
+    /// Extract text between byte offsets `[start, end)` without modifying the buffer.
+    pub fn slice(&self, start: usize, end: usize) -> String {
+        let start = start.min(self.len());
+        let end = end.min(self.len());
+        if start >= end {
+            return String::new();
+        }
+        let mut result = Vec::with_capacity(end - start);
+        for i in start..end {
+            if let Some(b) = self.byte_at(i) {
+                result.push(b);
+            }
+        }
+        String::from_utf8_lossy(&result).into_owned()
+    }
+
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.text_bytes()).into_owned()
     }
@@ -456,6 +472,27 @@ mod tests {
         buf.insert(5000, "MIDDLE");
         assert_eq!(buf.len(), 10246);
         assert_eq!(buf.char_at(5000), Some('M'));
+    }
+
+    #[test]
+    fn test_slice() {
+        let mut buf = Buffer::new();
+        buf.insert(0, "hello world");
+        assert_eq!(buf.slice(0, 5), "hello");
+        assert_eq!(buf.slice(6, 11), "world");
+        assert_eq!(buf.slice(0, 11), "hello world");
+        assert_eq!(buf.slice(5, 5), "");
+        assert_eq!(buf.slice(0, 0), "");
+        assert_eq!(buf.slice(0, 100), "hello world"); // clamped
+    }
+
+    #[test]
+    fn test_slice_utf8() {
+        let mut buf = Buffer::new();
+        buf.insert(0, "café ñ");
+        // c(1) a(1) f(1) é(2) = 5 bytes, then ' '(1) ñ(2) = 8 total
+        assert_eq!(buf.slice(0, 5), "café");
+        assert_eq!(buf.slice(6, 8), "ñ");
     }
 
     #[test]

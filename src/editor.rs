@@ -34,6 +34,16 @@ struct Prompt {
 }
 
 // ---------------------------------------------------------------------------
+// Selection
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+struct Selection {
+    anchor: usize, // byte offset where selection started
+    head: usize,   // byte offset at cursor end
+}
+
+// ---------------------------------------------------------------------------
 // Editor
 // ---------------------------------------------------------------------------
 
@@ -58,6 +68,10 @@ pub struct Editor {
 
     // Quit state
     quit_confirm: bool,
+
+    // Selection & clipboard
+    selection: Option<Selection>,
+    clipboard: String,
 
     // Active prompt (mini-prompt for Open, Save As, etc.)
     prompt: Option<Prompt>,
@@ -88,6 +102,8 @@ impl Editor {
             message: None,
             message_type: MessageType::Info,
             quit_confirm: false,
+            selection: None,
+            clipboard: String::new(),
             prompt: None,
             running: true,
         })
@@ -115,6 +131,8 @@ impl Editor {
             message: None,
             message_type: MessageType::Info,
             quit_confirm: false,
+            selection: None,
+            clipboard: String::new(),
             prompt: None,
             running: true,
         })
@@ -223,39 +241,48 @@ impl Editor {
                         .put_char(screen_row, sep_col, ' ', gutter_fg, gutter_bg, false);
                 }
 
-                // Line content
+                // Line content (with selection highlighting)
                 let line_text = self.buffer.get_line(file_line).unwrap_or_default();
+                let line_start_byte = self.buffer.line_start(file_line).unwrap_or(0);
+                let sel_range = self.selection_range();
                 let mut display_col: usize = 0;
+                let mut byte_offset_in_line: usize = 0;
                 for ch in line_text.chars() {
                     if display_col >= self.scroll_col {
                         let screen_col = display_col - self.scroll_col + self.gutter_width;
                         if screen_col >= screen_width {
                             break;
                         }
-                        self.screen.put_char(
-                            screen_row,
-                            screen_col,
-                            ch,
-                            Color::Default,
-                            Color::Default,
-                            false,
-                        );
+                        let char_byte = line_start_byte + byte_offset_in_line;
+                        let is_selected =
+                            sel_range.is_some_and(|(s, e)| char_byte >= s && char_byte < e);
+                        let (fg, bg, bold) = if is_selected {
+                            (Color::Ansi(0), Color::Ansi(7), true)
+                        } else {
+                            (Color::Default, Color::Default, false)
+                        };
+                        self.screen
+                            .put_char(screen_row, screen_col, ch, fg, bg, bold);
                     }
+                    byte_offset_in_line += ch.len_utf8();
                     display_col += 1;
                 }
-                // Fill remaining with spaces
+                // Fill remaining with spaces (selected if selection extends past EOL)
                 let start_fill = display_col
                     .saturating_sub(self.scroll_col)
                     .saturating_add(self.gutter_width);
+                let line_end_byte = line_start_byte + line_text.len();
                 for col in start_fill..screen_width {
-                    self.screen.put_char(
-                        screen_row,
-                        col,
-                        ' ',
-                        Color::Default,
-                        Color::Default,
-                        false,
-                    );
+                    // Show selection highlight on trailing space if newline is selected
+                    let is_trailing_selected = sel_range
+                        .is_some_and(|(s, e)| line_end_byte >= s && line_end_byte < e)
+                        && col == start_fill; // only first trailing cell
+                    let (fg, bg, bold) = if is_trailing_selected {
+                        (Color::Ansi(0), Color::Ansi(7), true)
+                    } else {
+                        (Color::Default, Color::Default, false)
+                    };
+                    self.screen.put_char(screen_row, col, ' ', fg, bg, bold);
                 }
             } else {
                 // Tilde line (past end of file)
@@ -435,6 +462,7 @@ impl Editor {
                         prompt.cursor_pos += text.len();
                     }
                 } else {
+                    self.delete_selection();
                     self.handle_paste(&text);
                 }
             }
@@ -453,50 +481,80 @@ impl Editor {
             self.quit_confirm = false;
         }
 
+        let is_nav = matches!(
+            &ke.key,
+            Key::Up
+                | Key::Down
+                | Key::Left
+                | Key::Right
+                | Key::Home
+                | Key::End
+                | Key::PageUp
+                | Key::PageDown
+        );
+
+        // Before navigation: start/continue selection if shift is held
+        if is_nav && ke.shift {
+            self.start_or_continue_selection();
+        }
+
         match (&ke.key, ke.ctrl, ke.alt) {
-            // -- Navigation --
-            (Key::Up, false, false) => self.cursor.move_up(&self.buffer),
-            (Key::Down, false, false) => self.cursor.move_down(&self.buffer),
-            (Key::Left, false, false) => self.cursor.move_left(&self.buffer),
-            (Key::Right, false, false) => self.cursor.move_right(&self.buffer),
+            // -- Navigation (works with and without shift) --
+            (Key::Up, false, _) => self.cursor.move_up(&self.buffer),
+            (Key::Down, false, _) => self.cursor.move_down(&self.buffer),
+            (Key::Left, false, _) => self.cursor.move_left(&self.buffer),
+            (Key::Right, false, _) => self.cursor.move_right(&self.buffer),
 
-            (Key::Left, true, false) => self.cursor.move_word_left(&self.buffer),
-            (Key::Right, true, false) => self.cursor.move_word_right(&self.buffer),
+            (Key::Left, true, _) => self.cursor.move_word_left(&self.buffer),
+            (Key::Right, true, _) => self.cursor.move_word_right(&self.buffer),
 
-            (Key::Home, false, false) => self.cursor.move_home(&self.buffer),
-            (Key::End, false, false) => self.cursor.move_end(&self.buffer),
+            (Key::Home, false, _) => self.cursor.move_home(&self.buffer),
+            (Key::End, false, _) => self.cursor.move_end(&self.buffer),
 
-            (Key::Home, true, false) => self.cursor.move_to_start(),
-            (Key::End, true, false) => self.cursor.move_to_end(&self.buffer),
+            (Key::Home, true, _) => self.cursor.move_to_start(),
+            (Key::End, true, _) => self.cursor.move_to_end(&self.buffer),
 
-            (Key::PageUp, false, false) => {
+            (Key::PageUp, false, _) => {
                 let h = self.text_area_height();
                 self.scroll_row = self.scroll_row.saturating_sub(h);
                 self.cursor.move_page_up(&self.buffer, h);
             }
-            (Key::PageDown, false, false) => {
+            (Key::PageDown, false, _) => {
                 let h = self.text_area_height();
                 let max_line = self.buffer.line_count().saturating_sub(1);
                 self.scroll_row = (self.scroll_row + h).min(max_line);
                 self.cursor.move_page_down(&self.buffer, h);
             }
 
-            // -- Editing --
+            // -- Editing (delete selection first if active) --
             (Key::Char(ch), false, false) => {
+                self.delete_selection();
                 self.insert_char(*ch);
             }
             (Key::Enter, false, false) => {
+                self.delete_selection();
                 self.insert_newline();
             }
             (Key::Tab, false, false) => {
+                self.delete_selection();
                 self.insert_tab();
             }
             (Key::Backspace, false, false) => {
-                self.backspace();
+                if self.delete_selection().is_none() {
+                    self.backspace();
+                }
             }
             (Key::Delete, false, false) => {
-                self.delete_at_cursor();
+                if self.delete_selection().is_none() {
+                    self.delete_at_cursor();
+                }
             }
+
+            // -- Clipboard --
+            (Key::Char('c'), true, false) => self.copy_selection(),
+            (Key::Char('x'), true, false) => self.cut_selection(),
+            (Key::Char('v'), true, false) => self.paste_clipboard(),
+            (Key::Char('a'), true, false) => self.select_all(),
 
             // -- Commands --
             (Key::Char('s'), true, false) => self.save(),
@@ -505,15 +563,6 @@ impl Editor {
             // -- Placeholders --
             (Key::Char('z'), true, false) => {
                 self.set_message("Undo not implemented yet", MessageType::Warning);
-            }
-            (Key::Char('c'), true, false) => {
-                self.set_message("Copy not implemented yet", MessageType::Warning);
-            }
-            (Key::Char('v'), true, false) => {
-                self.set_message("Paste not implemented yet", MessageType::Warning);
-            }
-            (Key::Char('x'), true, false) => {
-                self.set_message("Cut not implemented yet", MessageType::Warning);
             }
             (Key::Char('f'), true, false) => {
                 self.set_message("Find not implemented yet", MessageType::Warning);
@@ -524,6 +573,146 @@ impl Editor {
 
             _ => {}
         }
+
+        // After navigation: extend or clear selection
+        if is_nav {
+            if ke.shift {
+                self.extend_selection();
+            } else {
+                self.selection = None;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Selection helpers
+    // -----------------------------------------------------------------------
+
+    fn start_or_continue_selection(&mut self) {
+        if self.selection.is_none() {
+            let offset = self.cursor.byte_offset(&self.buffer);
+            self.selection = Some(Selection {
+                anchor: offset,
+                head: offset,
+            });
+        }
+    }
+
+    fn extend_selection(&mut self) {
+        if let Some(ref mut sel) = self.selection {
+            sel.head = self.cursor.byte_offset(&self.buffer);
+        }
+    }
+
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        self.selection.map(|sel| {
+            let start = sel.anchor.min(sel.head);
+            let end = sel.anchor.max(sel.head);
+            (start, end)
+        })
+    }
+
+    /// Delete the selected text, reposition cursor to selection start, clear selection.
+    /// Returns the deleted text if there was a selection.
+    fn delete_selection(&mut self) -> Option<String> {
+        let (start, end) = self.selection_range()?;
+        if start == end {
+            self.selection = None;
+            return None;
+        }
+        let deleted = self.buffer.slice(start, end);
+        self.buffer.delete(start, end - start);
+        // Reposition cursor to selection start
+        let line = self.buffer.byte_to_line(start);
+        let line_start = self.buffer.line_start(line).unwrap_or(0);
+        let col = start - line_start;
+        self.cursor.set_position(line, col, &self.buffer);
+        self.selection = None;
+        Some(deleted)
+    }
+
+    fn copy_selection(&mut self) {
+        if let Some((start, end)) = self.selection_range() {
+            if start == end {
+                // No selection: copy current line
+                self.copy_current_line();
+                return;
+            }
+            let text = self.buffer.slice(start, end);
+            let len = text.chars().count();
+            self.clipboard = text.clone();
+            terminal::set_clipboard_osc52(&text);
+            self.set_message(&format!("Copied {} chars", len), MessageType::Info);
+        } else {
+            // No selection: copy current line
+            self.copy_current_line();
+        }
+    }
+
+    fn copy_current_line(&mut self) {
+        let line_text = self.buffer.get_line(self.cursor.line).unwrap_or_default();
+        let text = format!("{}\n", line_text);
+        let len = line_text.chars().count();
+        self.clipboard = text.clone();
+        terminal::set_clipboard_osc52(&self.clipboard);
+        self.set_message(&format!("Copied line ({} chars)", len), MessageType::Info);
+    }
+
+    fn cut_selection(&mut self) {
+        if let Some((start, end)) = self.selection_range() {
+            if start == end {
+                self.cut_current_line();
+                return;
+            }
+            let text = self.delete_selection().unwrap_or_default();
+            let len = text.chars().count();
+            self.clipboard = text.clone();
+            terminal::set_clipboard_osc52(&text);
+            self.set_message(&format!("Cut {} chars", len), MessageType::Info);
+        } else {
+            self.cut_current_line();
+        }
+    }
+
+    fn cut_current_line(&mut self) {
+        let line = self.cursor.line;
+        let line_start = self.buffer.line_start(line).unwrap_or(0);
+        let line_end = self.buffer.line_end(line).unwrap_or(0);
+        // Include the newline if not the last line
+        let end = if line + 1 < self.buffer.line_count() {
+            line_end + 1
+        } else {
+            line_end
+        };
+        let text = self.buffer.slice(line_start, end);
+        let len = text.chars().count();
+        self.buffer.delete(line_start, end - line_start);
+        self.cursor.clamp(&self.buffer);
+        self.cursor.col = 0;
+        self.cursor.desired_col = 0;
+        self.clipboard = text.clone();
+        terminal::set_clipboard_osc52(&text);
+        self.set_message(&format!("Cut line ({} chars)", len), MessageType::Info);
+    }
+
+    fn paste_clipboard(&mut self) {
+        if self.clipboard.is_empty() {
+            self.set_message("Clipboard is empty", MessageType::Warning);
+            return;
+        }
+        // Delete selection if active
+        self.delete_selection();
+        let text = self.clipboard.clone();
+        self.handle_paste(&text);
+    }
+
+    fn select_all(&mut self) {
+        let len = self.buffer.len();
+        self.selection = Some(Selection {
+            anchor: 0,
+            head: len,
+        });
+        self.cursor.move_to_end(&self.buffer);
     }
 
     // -----------------------------------------------------------------------
@@ -618,6 +807,8 @@ impl Editor {
     // -----------------------------------------------------------------------
 
     fn handle_mouse_click(&mut self, col: u16, row: u16) {
+        self.selection = None;
+
         let screen_row = row as usize;
         let screen_col = col as usize;
 
@@ -773,6 +964,7 @@ impl Editor {
                         self.cursor = Cursor::new();
                         self.scroll_row = 0;
                         self.scroll_col = 0;
+                        self.selection = None;
                         self.gutter_width = compute_gutter_width(self.buffer.line_count());
                         self.set_message(&format!("Opened: {}", display_name), MessageType::Info);
                     }
@@ -898,6 +1090,63 @@ mod tests {
         // "café" = c(1) a(1) f(1) é(2) = 5 bytes
         assert_eq!(display_col_to_byte_col("café", 3), 3); // before 'é'
         assert_eq!(display_col_to_byte_col("café", 4), 5); // after 'é'
+    }
+
+    // -- Selection tests --
+
+    #[test]
+    fn test_selection_range_ordering() {
+        // anchor < head
+        let sel = Selection {
+            anchor: 5,
+            head: 10,
+        };
+        let (start, end) = {
+            let s = sel.anchor.min(sel.head);
+            let e = sel.anchor.max(sel.head);
+            (s, e)
+        };
+        assert_eq!(start, 5);
+        assert_eq!(end, 10);
+
+        // anchor > head (backwards selection)
+        let sel2 = Selection {
+            anchor: 10,
+            head: 5,
+        };
+        let (start2, end2) = {
+            let s = sel2.anchor.min(sel2.head);
+            let e = sel2.anchor.max(sel2.head);
+            (s, e)
+        };
+        assert_eq!(start2, 5);
+        assert_eq!(end2, 10);
+    }
+
+    #[test]
+    fn test_delete_selection_repositions_cursor() {
+        let mut buf = Buffer::new();
+        buf.insert(0, "hello world");
+        let mut cursor = Cursor::new();
+        cursor.set_position(0, 5, &buf);
+
+        // Simulate selection of " world" (bytes 5..11)
+        let sel = Selection {
+            anchor: 5,
+            head: 11,
+        };
+        let (start, end) = (sel.anchor.min(sel.head), sel.anchor.max(sel.head));
+        let deleted = buf.slice(start, end);
+        buf.delete(start, end - start);
+        let line = buf.byte_to_line(start);
+        let line_start = buf.line_start(line).unwrap_or(0);
+        let col = start - line_start;
+        cursor.set_position(line, col, &buf);
+
+        assert_eq!(deleted, " world");
+        assert_eq!(buf.text(), "hello");
+        assert_eq!(cursor.line, 0);
+        assert_eq!(cursor.col, 5);
     }
 
     // -- Prompt tests --

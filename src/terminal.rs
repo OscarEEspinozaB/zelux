@@ -278,3 +278,75 @@ pub fn move_cursor(row: u16, col: u16) {
 pub fn clear_screen() {
     write_all(b"\x1b[2J");
 }
+
+// ---------------------------------------------------------------------------
+// OSC 52 clipboard (system clipboard via terminal escape)
+// ---------------------------------------------------------------------------
+
+const BASE64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+pub fn base64_encode(data: &[u8]) -> String {
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
+    let chunks = data.chunks(3);
+    for chunk in chunks {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+
+        result.push(BASE64_TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        result.push(BASE64_TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(BASE64_TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(BASE64_TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
+}
+
+/// Write text to the system clipboard via OSC 52 escape sequence.
+/// This is write-only; reading relies on bracketed paste (Ctrl+V from terminal).
+pub fn set_clipboard_osc52(text: &str) {
+    let encoded = base64_encode(text.as_bytes());
+    let seq = format!("\x1b]52;c;{}\x07", encoded);
+    write_all(seq.as_bytes());
+    flush();
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_base64_encode_rfc4648() {
+        // RFC 4648 test vectors
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn test_base64_encode_utf8() {
+        assert_eq!(base64_encode("café".as_bytes()), "Y2Fmw6k=");
+    }
+
+    #[test]
+    fn test_detect_color_mode_default() {
+        // Just ensure it doesn't panic; actual result depends on env
+        let _mode = detect_color_mode();
+    }
+}
