@@ -4,6 +4,7 @@ mod editor;
 mod input;
 mod render;
 mod terminal;
+mod undo;
 
 use std::env;
 use std::path::Path;

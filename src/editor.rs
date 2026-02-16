@@ -5,6 +5,7 @@ use crate::cursor::Cursor;
 use crate::input::{self, Event, Key, KeyEvent, MouseButton};
 use crate::render::{Color, Screen};
 use crate::terminal::{self, ColorMode, Terminal};
+use crate::undo::{CursorState, GroupContext, Operation, UndoStack};
 
 // ---------------------------------------------------------------------------
 // Message types
@@ -76,6 +77,9 @@ pub struct Editor {
     // Active prompt (mini-prompt for Open, Save As, etc.)
     prompt: Option<Prompt>,
 
+    // Undo/redo
+    undo_stack: UndoStack,
+
     running: bool,
 }
 
@@ -105,6 +109,7 @@ impl Editor {
             selection: None,
             clipboard: String::new(),
             prompt: None,
+            undo_stack: UndoStack::new(),
             running: true,
         })
     }
@@ -134,6 +139,7 @@ impl Editor {
             selection: None,
             clipboard: String::new(),
             prompt: None,
+            undo_stack: UndoStack::new(),
             running: true,
         })
     }
@@ -560,10 +566,28 @@ impl Editor {
             (Key::Char('s'), true, false) => self.save(),
             (Key::Char('q'), true, false) => self.quit(),
 
-            // -- Placeholders --
+            // -- Undo/Redo --
             (Key::Char('z'), true, false) => {
-                self.set_message("Undo not implemented yet", MessageType::Warning);
+                self.selection = None;
+                let cs = self.cursor_state();
+                if let Some(restored) = self.undo_stack.undo(&mut self.buffer, cs) {
+                    self.restore_cursor(restored);
+                    self.set_message("Undo", MessageType::Info);
+                } else {
+                    self.set_message("Nothing to undo", MessageType::Warning);
+                }
             }
+            (Key::Char('y'), true, false) => {
+                self.selection = None;
+                if let Some(restored) = self.undo_stack.redo(&mut self.buffer) {
+                    self.restore_cursor(restored);
+                    self.set_message("Redo", MessageType::Info);
+                } else {
+                    self.set_message("Nothing to redo", MessageType::Warning);
+                }
+            }
+
+            // -- Placeholders --
             (Key::Char('f'), true, false) => {
                 self.set_message("Find not implemented yet", MessageType::Warning);
             }
@@ -620,8 +644,17 @@ impl Editor {
             self.selection = None;
             return None;
         }
+        let before = self.cursor_state();
         let deleted = self.buffer.slice(start, end);
         self.buffer.delete(start, end - start);
+        self.undo_stack.record(
+            Operation::Delete {
+                pos: start,
+                text: deleted.clone(),
+            },
+            before,
+            GroupContext::Other,
+        );
         // Reposition cursor to selection start
         let line = self.buffer.byte_to_line(start);
         let line_start = self.buffer.line_start(line).unwrap_or(0);
@@ -675,6 +708,7 @@ impl Editor {
     }
 
     fn cut_current_line(&mut self) {
+        let before = self.cursor_state();
         let line = self.cursor.line;
         let line_start = self.buffer.line_start(line).unwrap_or(0);
         let line_end = self.buffer.line_end(line).unwrap_or(0);
@@ -687,6 +721,14 @@ impl Editor {
         let text = self.buffer.slice(line_start, end);
         let len = text.chars().count();
         self.buffer.delete(line_start, end - line_start);
+        self.undo_stack.record(
+            Operation::Delete {
+                pos: line_start,
+                text: text.clone(),
+            },
+            before,
+            GroupContext::Cut,
+        );
         self.cursor.clamp(&self.buffer);
         self.cursor.col = 0;
         self.cursor.desired_col = 0;
@@ -716,26 +758,72 @@ impl Editor {
     }
 
     // -----------------------------------------------------------------------
+    // Undo helpers
+    // -----------------------------------------------------------------------
+
+    fn cursor_state(&self) -> CursorState {
+        CursorState {
+            line: self.cursor.line,
+            col: self.cursor.col,
+            desired_col: self.cursor.desired_col,
+        }
+    }
+
+    fn restore_cursor(&mut self, state: CursorState) {
+        self.cursor.line = state.line;
+        self.cursor.col = state.col;
+        self.cursor.desired_col = state.desired_col;
+        self.cursor.clamp(&self.buffer);
+    }
+
+    // -----------------------------------------------------------------------
     // Editing operations
     // -----------------------------------------------------------------------
 
     fn insert_char(&mut self, ch: char) {
+        let before = self.cursor_state();
         let pos = self.cursor.byte_offset(&self.buffer);
         let mut buf = [0u8; 4];
         let s = ch.encode_utf8(&mut buf);
         self.buffer.insert(pos, s);
+        self.undo_stack.record(
+            Operation::Insert {
+                pos,
+                text: s.to_string(),
+            },
+            before,
+            GroupContext::Typing,
+        );
         self.cursor.move_right(&self.buffer);
     }
 
     fn insert_newline(&mut self) {
+        let before = self.cursor_state();
         let pos = self.cursor.byte_offset(&self.buffer);
         self.buffer.insert(pos, "\n");
+        self.undo_stack.record(
+            Operation::Insert {
+                pos,
+                text: "\n".to_string(),
+            },
+            before,
+            GroupContext::Other,
+        );
         self.cursor.move_right(&self.buffer);
     }
 
     fn insert_tab(&mut self) {
+        let before = self.cursor_state();
         let pos = self.cursor.byte_offset(&self.buffer);
         self.buffer.insert(pos, "    ");
+        self.undo_stack.record(
+            Operation::Insert {
+                pos,
+                text: "    ".to_string(),
+            },
+            before,
+            GroupContext::Other,
+        );
         // Move right 4 times for 4 spaces
         for _ in 0..4 {
             self.cursor.move_right(&self.buffer);
@@ -747,11 +835,21 @@ impl Editor {
         if pos == 0 {
             return;
         }
+        let before = self.cursor_state();
         // Move cursor left first (handles UTF-8 boundaries)
         self.cursor.move_left(&self.buffer);
         let new_pos = self.cursor.byte_offset(&self.buffer);
         let delete_len = pos - new_pos;
+        let deleted = self.buffer.slice(new_pos, pos);
         self.buffer.delete(new_pos, delete_len);
+        self.undo_stack.record(
+            Operation::Delete {
+                pos: new_pos,
+                text: deleted,
+            },
+            before,
+            GroupContext::Deleting,
+        );
     }
 
     fn delete_at_cursor(&mut self) {
@@ -761,8 +859,15 @@ impl Editor {
         }
         // Find the length of the character at cursor position
         if let Some(ch) = self.buffer.char_at(pos) {
+            let before = self.cursor_state();
             let char_len = ch.len_utf8();
+            let deleted = self.buffer.slice(pos, pos + char_len);
             self.buffer.delete(pos, char_len);
+            self.undo_stack.record(
+                Operation::Delete { pos, text: deleted },
+                before,
+                GroupContext::Deleting,
+            );
             self.cursor.clamp(&self.buffer);
         }
     }
@@ -782,6 +887,7 @@ impl Editor {
         match self.buffer.save() {
             Ok(()) => {
                 self.buffer.mark_saved();
+                self.undo_stack.mark_saved(self.cursor_state());
                 self.set_message("Saved!", MessageType::Info);
             }
             Err(e) => {
@@ -840,8 +946,17 @@ impl Editor {
     // -----------------------------------------------------------------------
 
     fn handle_paste(&mut self, text: &str) {
+        let before = self.cursor_state();
         let pos = self.cursor.byte_offset(&self.buffer);
         self.buffer.insert(pos, text);
+        self.undo_stack.record(
+            Operation::Insert {
+                pos,
+                text: text.to_string(),
+            },
+            before,
+            GroupContext::Paste,
+        );
         // Advance cursor past inserted text
         for _ in text.chars() {
             self.cursor.move_right(&self.buffer);
@@ -965,6 +1080,7 @@ impl Editor {
                         self.scroll_row = 0;
                         self.scroll_col = 0;
                         self.selection = None;
+                        self.undo_stack.clear();
                         self.gutter_width = compute_gutter_width(self.buffer.line_count());
                         self.set_message(&format!("Opened: {}", display_name), MessageType::Info);
                     }
